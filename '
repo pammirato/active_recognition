@@ -2,8 +2,10 @@ import copy
 import glob
 import os
 import time
+import importlib
 
 import gym
+import gym_AVD
 import numpy as np
 import torch
 import torch.nn as nn
@@ -15,11 +17,17 @@ from arguments import get_args
 from baselines.common.vec_env.dummy_vec_env import DummyVecEnv
 from baselines.common.vec_env.subproc_vec_env import SubprocVecEnv
 from baselines.common.vec_env.vec_normalize import VecNormalize
-from envs import make_env
+from envs_tdid import make_env
 from kfac import KFACOptimizer
-from model import CNNPolicy, MLPPolicy
+from model_tdid import CNNPolicy, MLPPolicy
 from storage import RolloutStorage
 from visualize import visdom_plot
+
+#from target_driven_instance_detection.model_defs.TDID import TDID
+
+tdid_cfg_file = 'configTEST' #NO FILE EXTENSTION!
+tdid_cfg = importlib.import_module('target_driven_instance_detection.configs.'+tdid_cfg_file)
+tdid_cfg = tdid_cfg.get_config()
 
 args = get_args()
 
@@ -57,23 +65,25 @@ def main():
     envs = [make_env(args.env_name, args.seed, i, args.log_dir)
                 for i in range(args.num_processes)]
 
-    if args.num_processes > 1:
-        envs = SubprocVecEnv(envs)
-    else:
-        envs = DummyVecEnv(envs)
+    #if args.num_processes > 1:
+    envs = SubprocVecEnv(envs)
+    #else:
+    #    envs = DummyVecEnv(envs)
 
-    if len(envs.observation_space.shape) == 1:
-        envs = VecNormalize(envs)
+    #if len(envs.observation_space.shape) == 1:
+    #    envs = VecNormalize(envs)
 
-    obs_shape = envs.observation_space.shape
-    obs_shape = (obs_shape[0] * args.num_stack, *obs_shape[1:])
+    obs_shape = envs.observation_space.spaces['scene_image'].shape
+    #obs_shape = envs.observation_space.shape
+    #obs_shape = (obs_shape[0] * args.num_stack, *obs_shape[1:])
 
-    if len(envs.observation_space.shape) == 3:
-        actor_critic = CNNPolicy(obs_shape[0], envs.action_space, args.recurrent_policy)
-    else:
-        assert not args.recurrent_policy, \
-            "Recurrent policy is not implemented for the MLP controller"
-        actor_critic = MLPPolicy(obs_shape[0], envs.action_space)
+    #if len(envs.observation_space.shape) == 3:
+        #actor_critic = CNNPolicy(obs_shape[0], envs.action_space, args.recurrent_policy)
+    actor_critic = CNNPolicy(obs_shape, envs.action_space, args.recurrent_policy, tdid_cfg)
+    #else:
+    #    assert not args.recurrent_policy, \
+    #        "Recurrent policy is not implemented for the MLP controller"
+    #    actor_critic = MLPPolicy(obs_shape[0], envs.action_space)
 
     if envs.action_space.__class__.__name__ == "Discrete":
         action_shape = 1
@@ -94,14 +104,21 @@ def main():
     current_obs = torch.zeros(args.num_processes, *obs_shape)
 
     def update_current_obs(obs):
-        shape_dim0 = envs.observation_space.shape[0]
-        obs = torch.from_numpy(obs).float()
-        if args.num_stack > 1:
-            current_obs[:, :-shape_dim0] = current_obs[:, shape_dim0:]
-        current_obs[:, -shape_dim0:] = obs
+        #shape_dim0 = envs.observation_space.shape[0]
+        #obs = torch.from_numpy(obs).float()
+        #if args.num_stack > 1:
+        #    current_obs[:, :-shape_dim0] = current_obs[:, shape_dim0:]
+        #current_obs[:, -shape_dim0:] = obs
+        current_obs[:,-shape_dim0] = obs
 
     obs = envs.reset()
-    update_current_obs(obs)
+    all_scene_images = []
+    for obs_ind in range(0,len(obs)):
+        all_scene_images.append(obs[0]['scene_image'])
+    all_scene_images = np.stack(all_scene_images)
+
+    update_current_obs(all_scene_images)
+    target_data = obs['target_image']
 
     rollouts.observations[0].copy_(current_obs)
 
@@ -126,9 +143,6 @@ def main():
             obs, reward, done, info = envs.step(cpu_actions)
             reward = torch.from_numpy(np.expand_dims(np.stack(reward), 1)).float()
             episode_rewards += reward
-
-            if any(done):
-                breakp = 1
 
             # If done then clean the history of observations.
             masks = torch.FloatTensor([[0.0] if done_ else [1.0] for done_ in done])

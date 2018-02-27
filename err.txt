@@ -1,0 +1,16 @@
+#######
+WARNING: All rewards are clipped or normalized so you need to use a monitor (see envs.py) or visdom plot to get true rewards
+#######
+torch.Size([512, 1, 16, 30])
+torch.Size([512, 1, 16, 30])
+torch.Size([512, 1, 16, 30])
+torch.Size([512, 1, 16, 30])
+torch.Size([512, 1, 16, 30])
+#######
+WARNING: All rewards are clipped or normalized so you need to use a monitor (see envs.py) or visdom plot to get true rewards
+#######
+torch.Size([512, 1, 16, 30])
+torch.Size([512, 1, 16, 30])
+torch.Size([512, 1, 16, 30])
+torch.Size([512, 1, 16, 30])
+torch.Size([512, 1, 16, 30])

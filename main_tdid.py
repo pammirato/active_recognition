@@ -2,8 +2,10 @@ import copy
 import glob
 import os
 import time
+import importlib
 
 import gym
+import gym_AVD
 import numpy as np
 import torch
 import torch.nn as nn
@@ -15,11 +17,17 @@ from arguments import get_args
 from baselines.common.vec_env.dummy_vec_env import DummyVecEnv
 from baselines.common.vec_env.subproc_vec_env import SubprocVecEnv
 from baselines.common.vec_env.vec_normalize import VecNormalize
-from envs import make_env
+from envs_tdid import make_env
 from kfac import KFACOptimizer
-from model import CNNPolicy, MLPPolicy
+from model_tdid import CNNPolicy, MLPPolicy
 from storage import RolloutStorage
 from visualize import visdom_plot
+
+#from target_driven_instance_detection.model_defs.TDID import TDID
+
+tdid_cfg_file = 'configTEST' #NO FILE EXTENSTION!
+tdid_cfg = importlib.import_module('target_driven_instance_detection.configs.'+tdid_cfg_file)
+tdid_cfg = tdid_cfg.get_config()
 
 args = get_args()
 
@@ -57,23 +65,25 @@ def main():
     envs = [make_env(args.env_name, args.seed, i, args.log_dir)
                 for i in range(args.num_processes)]
 
-    if args.num_processes > 1:
-        envs = SubprocVecEnv(envs)
-    else:
-        envs = DummyVecEnv(envs)
+    #if args.num_processes > 1:
+    envs = SubprocVecEnv(envs)
+    #else:
+    #    envs = DummyVecEnv(envs)
 
-    if len(envs.observation_space.shape) == 1:
-        envs = VecNormalize(envs)
+    #if len(envs.observation_space.shape) == 1:
+    #    envs = VecNormalize(envs)
 
-    obs_shape = envs.observation_space.shape
-    obs_shape = (obs_shape[0] * args.num_stack, *obs_shape[1:])
+    obs_shape = envs.observation_space.spaces['scene_image'].shape
+    #obs_shape = envs.observation_space.shape
+    #obs_shape = (obs_shape[0] * args.num_stack, *obs_shape[1:])
 
-    if len(envs.observation_space.shape) == 3:
-        actor_critic = CNNPolicy(obs_shape[0], envs.action_space, args.recurrent_policy)
-    else:
-        assert not args.recurrent_policy, \
-            "Recurrent policy is not implemented for the MLP controller"
-        actor_critic = MLPPolicy(obs_shape[0], envs.action_space)
+    #if len(envs.observation_space.shape) == 3:
+        #actor_critic = CNNPolicy(obs_shape[0], envs.action_space, args.recurrent_policy)
+    actor_critic = CNNPolicy(obs_shape, envs.action_space, args.recurrent_policy, tdid_cfg)
+    #else:
+    #    assert not args.recurrent_policy, \
+    #        "Recurrent policy is not implemented for the MLP controller"
+    #    actor_critic = MLPPolicy(obs_shape[0], envs.action_space)
 
     if envs.action_space.__class__.__name__ == "Discrete":
         action_shape = 1
@@ -94,14 +104,28 @@ def main():
     current_obs = torch.zeros(args.num_processes, *obs_shape)
 
     def update_current_obs(obs):
-        shape_dim0 = envs.observation_space.shape[0]
-        obs = torch.from_numpy(obs).float()
+        #shape_dim0 = envs.observation_space.shape[0]
+        #obs = torch.from_numpy(obs).float()
+        #if args.num_stack > 1:
+        #    current_obs[:, :-shape_dim0] = current_obs[:, shape_dim0:]
+        #current_obs[:, -shape_dim0:] = obs
+
+        num_chnls = obs.shape[-1]
         if args.num_stack > 1:
-            current_obs[:, :-shape_dim0] = current_obs[:, shape_dim0:]
-        current_obs[:, -shape_dim0:] = obs
+            current_obs[:,:,:, :-num_chnls] = current_obs[:,:,:, num_chnls:]
+        current_obs[:,:,:, -num_chnls:] = torch.FloatTensor(obs)
+        
 
     obs = envs.reset()
-    update_current_obs(obs)
+    all_scene_images = []
+    all_target_images = []
+    for obs_ind in range(0,len(obs)):
+        all_scene_images.append(obs[obs_ind]['scene_image'])
+        all_target_images.append(obs[obs_ind]['target_image'])
+    all_scene_images = np.stack(all_scene_images)
+    all_target_images = torch.FloatTensor(match_and_concat_images_list(all_target_images))
+
+    update_current_obs(all_scene_images)
 
     rollouts.observations[0].copy_(current_obs)
 
@@ -111,24 +135,25 @@ def main():
 
     if args.cuda:
         current_obs = current_obs.cuda()
+        all_target_images = all_target_images.cuda()
         rollouts.cuda()
 
     start = time.time()
     for j in range(num_updates):
         for step in range(args.num_steps):
+            print('STEP: {}'.format(step))
             # Sample actions
-            value, action, action_log_prob, states = actor_critic.act(Variable(rollouts.observations[step], volatile=True),
-                                                                      Variable(rollouts.states[step], volatile=True),
-                                                                      Variable(rollouts.masks[step], volatile=True))
+            value, action, action_log_prob, states = \
+                actor_critic.act(Variable(rollouts.observations[step], volatile=True),
+                                 Variable(all_target_images, volatile=True),
+                                 Variable(rollouts.states[step], volatile=True),
+                                 Variable(rollouts.masks[step], volatile=True))
             cpu_actions = action.data.squeeze(1).cpu().numpy()
 
             # Obser reward and next obs
             obs, reward, done, info = envs.step(cpu_actions)
             reward = torch.from_numpy(np.expand_dims(np.stack(reward), 1)).float()
             episode_rewards += reward
-
-            if any(done):
-                breakp = 1
 
             # If done then clean the history of observations.
             masks = torch.FloatTensor([[0.0] if done_ else [1.0] for done_ in done])
@@ -144,20 +169,36 @@ def main():
             else:
                 current_obs *= masks
 
-            update_current_obs(obs)
+
+
+            all_scene_images = []
+            for obs_ind in range(0,len(obs)):
+                all_scene_images.append(obs[obs_ind]['scene_image'])
+            all_scene_images = np.stack(all_scene_images)
+            update_current_obs(all_scene_images)
             rollouts.insert(step, current_obs, states.data, action.data, action_log_prob.data, value.data, reward, masks)
 
         next_value = actor_critic(Variable(rollouts.observations[-1], volatile=True),
+                                 Variable(all_target_images, volatile=True),
                                   Variable(rollouts.states[-1], volatile=True),
                                   Variable(rollouts.masks[-1], volatile=True))[0].data
 
         rollouts.compute_returns(next_value, args.use_gae, args.gamma, args.tau)
 
         if args.algo in ['a2c', 'acktr']:
-            values, action_log_probs, dist_entropy, states = actor_critic.evaluate_actions(Variable(rollouts.observations[:-1].view(-1, *obs_shape)),
-                                                                                           Variable(rollouts.states[0].view(-1, actor_critic.state_size)),
-                                                                                           Variable(rollouts.masks[:-1].view(-1, 1)),
-                                                                                           Variable(rollouts.actions.view(-1, action_shape)))
+
+            expanded_target_images = [] 
+            for process in range(args.num_processes):
+                for step in range(args.num_steps):
+                    expanded_target_images.append(all_target_images[2*process:2*(process+1),:].cpu().numpy())
+            expanded_target_images = torch.FloatTensor(match_and_concat_images_list(expanded_target_images)).cuda()
+
+            values, action_log_probs, dist_entropy, states = \
+                 actor_critic.evaluate_actions(Variable(rollouts.observations[:-1].view(-1, *obs_shape)),
+                                               Variable(expanded_target_images),
+                                               Variable(rollouts.states[0].view(-1, actor_critic.state_size)),
+                                               Variable(rollouts.masks[:-1].view(-1, 1)),
+                                               Variable(rollouts.actions.view(-1, action_shape)))
 
             values = values.view(args.num_steps, args.num_processes, 1)
             action_log_probs = action_log_probs.view(args.num_steps, args.num_processes, 1)
@@ -263,6 +304,53 @@ def main():
                 win = visdom_plot(viz, win, args.log_dir, args.env_name, args.algo)
             except IOError:
                 pass
+
+
+
+
+def match_and_concat_images_list(img_list, min_size=None):
+    """ 
+    Stacks image in a list into a single ndarray 
+
+    Input parameters:
+        img_list: (list) list of ndarrays, images to be stacked. If images
+                  are not the same shape, zero padding will be used to make
+                  them the same size. 
+
+        min_size (optional): (int) If not None, ensures images are at least
+                             min_size x min_size. Default: None 
+
+    Returns:
+        (ndarray) a single ndarray with first dimension equal to the 
+        number of elements in the inputted img_list    
+    """
+    #find size all images will be
+    max_rows = 0 
+    max_cols = 0 
+    for img in img_list:
+        max_rows = max(img.shape[1], max_rows)
+        max_cols = max(img.shape[2], max_cols)
+    if min_size is not None:
+        max_rows = max(max_rows,min_size)
+        max_cols = max(max_cols,min_size)
+
+    #resize and stack the images
+    for il,img in enumerate(img_list):
+        resized_img = np.zeros((img.shape[0],max_rows,max_cols,img.shape[3]))
+        resized_img[:,0:img.shape[1],0:img.shape[2],:] = img 
+        img_list[il] = resized_img
+    return np.concatenate(img_list,axis=0)
+
+
+
+
+
+
+
+
+
+
+
 
 if __name__ == "__main__":
     main()
