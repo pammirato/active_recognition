@@ -30,6 +30,9 @@ if args.recurrent_policy:
 
 num_updates = int(args.num_frames) // args.num_steps // args.num_processes
 
+args.seed = 2413241242343 
+
+
 torch.manual_seed(args.seed)
 if args.cuda:
     torch.cuda.manual_seed(args.seed)
@@ -67,6 +70,7 @@ def main():
 
     obs_shape = envs.observation_space.shape
     obs_shape = (obs_shape[0] * args.num_stack, *obs_shape[1:])
+#    target_shape = 
 
     if len(envs.observation_space.shape) == 3:
         actor_critic = CNNPolicy(obs_shape[0], envs.action_space, args.recurrent_policy)

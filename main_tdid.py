@@ -20,7 +20,7 @@ from baselines.common.vec_env.vec_normalize import VecNormalize
 from envs_tdid import make_env
 from kfac import KFACOptimizer
 from model_tdid import CNNPolicy, MLPPolicy
-from storage import RolloutStorage
+from storage_tdid import RolloutStorage
 from visualize import visdom_plot
 
 #from target_driven_instance_detection.model_defs.TDID import TDID
@@ -74,6 +74,7 @@ def main():
     #    envs = VecNormalize(envs)
 
     obs_shape = envs.observation_space.spaces['scene_image'].shape
+    target_shape = envs.observation_space.spaces['target_image'].shape
     #obs_shape = envs.observation_space.shape
     #obs_shape = (obs_shape[0] * args.num_stack, *obs_shape[1:])
 
@@ -100,10 +101,12 @@ def main():
     elif args.algo == 'acktr':
         optimizer = KFACOptimizer(actor_critic)
 
-    rollouts = RolloutStorage(args.num_steps, args.num_processes, obs_shape, envs.action_space, actor_critic.state_size)
+    rollouts = RolloutStorage(args.num_steps, args.num_processes, obs_shape,target_shape, envs.action_space, actor_critic.state_size)
     current_obs = torch.zeros(args.num_processes, *obs_shape)
+    current_target = torch.zeros(2*args.num_processes, *target_shape)
 
-    def update_current_obs(obs):
+
+    def update_current_obs(obs, target):
         #shape_dim0 = envs.observation_space.shape[0]
         #obs = torch.from_numpy(obs).float()
         #if args.num_stack > 1:
@@ -113,7 +116,9 @@ def main():
         num_chnls = obs.shape[-1]
         if args.num_stack > 1:
             current_obs[:,:,:, :-num_chnls] = current_obs[:,:,:, num_chnls:]
+            current_target[:,:,:, :-num_chnls] = current_target[:,:,:, num_chnls:]
         current_obs[:,:,:, -num_chnls:] = torch.FloatTensor(obs)
+        current_target[:,:,:, -num_chnls:] = torch.FloatTensor(target)
         
 
     obs = envs.reset()
@@ -123,11 +128,13 @@ def main():
         all_scene_images.append(obs[obs_ind]['scene_image'])
         all_target_images.append(obs[obs_ind]['target_image'])
     all_scene_images = np.stack(all_scene_images)
+    #all_target_images = np.stack(all_target_images)
     all_target_images = torch.FloatTensor(match_and_concat_images_list(all_target_images))
 
-    update_current_obs(all_scene_images)
+    update_current_obs(all_scene_images, all_target_images)
 
     rollouts.observations[0].copy_(current_obs)
+    rollouts.targets[0].copy_(current_target)
 
     # These variables are used to compute average rewards for all processes.
     episode_rewards = torch.zeros([args.num_processes, 1])
@@ -135,7 +142,8 @@ def main():
 
     if args.cuda:
         current_obs = current_obs.cuda()
-        all_target_images = all_target_images.cuda()
+        current_target = current_target.cuda()
+        #all_target_images = all_target_images.cuda()
         rollouts.cuda()
 
     start = time.time()
@@ -145,7 +153,8 @@ def main():
             # Sample actions
             value, action, action_log_prob, states = \
                 actor_critic.act(Variable(rollouts.observations[step], volatile=True),
-                                 Variable(all_target_images, volatile=True),
+                                 Variable(rollouts.targets[step], volatile=True),
+                #                 Variable(all_target_images, volatile=True),
                                  Variable(rollouts.states[step], volatile=True),
                                  Variable(rollouts.masks[step], volatile=True))
             cpu_actions = action.data.squeeze(1).cpu().numpy()
@@ -166,20 +175,27 @@ def main():
 
             if current_obs.dim() == 4:
                 current_obs *= masks.unsqueeze(2).unsqueeze(2)
+                #current_target *= np.concat([masks.unsqueeze(2).unsqueeze(2),masks.unsqueeze(2).unsqueeze(2)],axis=0)
             else:
                 current_obs *= masks
+                #current_target *= np.concat([masks,masks],axis=0)
 
 
 
             all_scene_images = []
+            all_target_images = []
             for obs_ind in range(0,len(obs)):
                 all_scene_images.append(obs[obs_ind]['scene_image'])
+                all_target_images.append(obs[obs_ind]['target_image'])
             all_scene_images = np.stack(all_scene_images)
-            update_current_obs(all_scene_images)
-            rollouts.insert(step, current_obs, states.data, action.data, action_log_prob.data, value.data, reward, masks)
+            #all_target_images = np.stack(all_target_images)
+            all_target_images = torch.FloatTensor(match_and_concat_images_list(all_target_images))
+            update_current_obs(all_scene_images,all_target_images)
+            rollouts.insert(step, current_obs, current_target, states.data, action.data, action_log_prob.data, value.data, reward, masks)
 
         next_value = actor_critic(Variable(rollouts.observations[-1], volatile=True),
-                                 Variable(all_target_images, volatile=True),
+                                  Variable(rollouts.targets[-1], volatile=True),
+              #                    Variable(all_target_images, volatile=True),
                                   Variable(rollouts.states[-1], volatile=True),
                                   Variable(rollouts.masks[-1], volatile=True))[0].data
 
@@ -187,15 +203,16 @@ def main():
 
         if args.algo in ['a2c', 'acktr']:
 
-            expanded_target_images = [] 
-            for process in range(args.num_processes):
-                for step in range(args.num_steps):
-                    expanded_target_images.append(all_target_images[2*process:2*(process+1),:].cpu().numpy())
-            expanded_target_images = torch.FloatTensor(match_and_concat_images_list(expanded_target_images)).cuda()
+            #expanded_target_images = [] 
+            #for process in range(args.num_processes):
+            #    for step in range(args.num_steps):
+            #        expanded_target_images.append(all_target_images[2*process:2*(process+1),:].cpu().numpy())
+            #expanded_target_images = torch.FloatTensor(match_and_concat_images_list(expanded_target_images)).cuda()
 
             values, action_log_probs, dist_entropy, states = \
                  actor_critic.evaluate_actions(Variable(rollouts.observations[:-1].view(-1, *obs_shape)),
-                                               Variable(expanded_target_images),
+                                               Variable(rollouts.targets[:-1].view(-1, *target_shape)),
+             #                                  Variable(expanded_target_images),
                                                Variable(rollouts.states[0].view(-1, actor_critic.state_size)),
                                                Variable(rollouts.masks[:-1].view(-1, 1)),
                                                Variable(rollouts.actions.view(-1, action_shape)))

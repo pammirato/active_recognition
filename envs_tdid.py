@@ -14,7 +14,7 @@ except ImportError:
     pass
 
 bp = '/net/bvisionserver3/playpen10/ammirato/Data/HalvedRohitData/'
-tp = '/net/bvisionserver3/playpen10/ammirato/Data/instance_detection_targets/uw_real_and_BB'
+tp = '/net/bvisionserver3/playpen10/ammirato/Data/instance_detection_targets/uw_real_and_BB_square_100'
 
 def make_env(env_id, seed, rank, log_dir):
     def _thunk():
